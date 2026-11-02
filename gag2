@@ -1,0 +1,1001 @@
+-- Check for table that is shared between executions.
+if not shared then
+    return warn("No shared, no script.")
+end
+
+-- Services.
+local playersService = game:GetService("Players")
+local replicatedStorage = game:GetService("ReplicatedStorage")
+local userInputService = game:GetService("UserInputService")
+local tweenService = game:GetService("TweenService")
+local teleportService = game:GetService("TeleportService")
+local lighting = game:GetService("Lighting")
+
+-- State.
+local localPlayer = playersService.LocalPlayer
+local packetEvent = replicatedStorage:WaitForChild("SharedModules"):WaitForChild("Packet"):WaitForChild("RemoteEvent")
+local gardens = workspace:WaitForChild("Gardens")
+
+local state = {
+    autoHarvest = false,
+    autoSteal = false,
+    autoSell = false,
+    autoBuy = false,
+    autoPlant = false,
+    autoProtect = false,
+    autoExpand = false,
+    flingOwner = false,
+    isUnloaded = false,
+    stealSortMethod = "Most Expensive",
+    stealTargetPlayer = "All Players",
+    lastSeq = 10,
+    cachedPlot = nil,
+    isPlanting = false,
+    instantHarvest = false, -- INSTANT HARVEST TOGGLE
+    
+    buyTargets = {}, 
+    
+    -- Sub-features
+    tweenSpeed = 150, 
+    stealWalkSpeed = 35,
+    protectTweenSpeed = 25,
+    dodgeRange = 25,
+    harvestDelay = 0.1,
+    plantDelay = 0.3,
+    buyDelay = 0.15,
+    sellDelay = 0.5,
+    
+    -- Fruit Filters
+    minKg = 0,
+    maxKg = 100000,
+    mutationMode = "All", 
+    targetMutation = "",
+    
+    -- Auto-Sell Threshold
+    autoSellAfterHarvest = false,
+    sellThreshold = 15,
+    harvestedCount = 0,
+    
+    -- Inventory Management
+    maxInventoryItems = 80,
+}
+
+-- Constants.
+local SPACING = 5
+local SEED_LIST = {
+    "Carrot", "Strawberry", "Blueberry", "Tulip", "Tomato", "Apple", 
+    "Bamboo", "Corn", "Cactus", "Pineapple", "Mushroom", "Green Bean", 
+    "Banana", "Grape", "Coconut", "Mango", "Acorn", "Cherry", 
+    "Dragon Fruit", "Dragon's Breath", "Moon Bloom", "Poison Apple", 
+    "Pomegranate", "Sunflower", "Venom Spitter", "Venus Fly Trap"
+}
+
+local SEED_PRICES = {
+    ["Carrot"] = 1, ["Strawberry"] = 10, ["Blueberry"] = 25, ["Tulip"] = 40,
+    ["Tomato"] = 200, ["Apple"] = 400, ["Bamboo"] = 700, ["Corn"] = 2500,
+    ["Cactus"] = 5000, ["Pineapple"] = 10000, ["Mushroom"] = 15000, ["Green Bean"] = 20000,
+    ["Banana"] = 30000, ["Grape"] = 50000, ["Coconut"] = 140000, ["Mango"] = 300000,
+    ["Acorn"] = 700000, ["Cherry"] = 1200000, ["Dragon Fruit"] = 120000, ["Dragon's Breath"] = 90000000,
+    ["Moon Bloom"] = 65000000, ["Poison Apple"] = 25000000, ["Pomegranate"] = 12000000, ["Sunflower"] = 5000000,
+    ["Venom Spitter"] = 10000000, ["Venus Fly Trap"] = 7000000,
+}
+
+local SEED_SET = {}
+for _, name in ipairs(SEED_LIST) do SEED_SET[name] = true end
+
+local function getPlayerList()
+    local list = {"All Players"}
+    for _, p in ipairs(playersService:GetPlayers()) do
+        if p ~= localPlayer then
+            table.insert(list, p.Name)
+        end
+    end
+    return list
+end
+
+local function packFloats(pos)
+    local b = buffer.create(12)
+    buffer.writef32(b, 0, pos.X)
+    buffer.writef32(b, 4, pos.Y)
+    buffer.writef32(b, 8, pos.Z)
+    return buffer.tostring(b)
+end
+
+local function firePacket(payload)
+    if typeof(payload) == "string" and #payload > 0 then
+        pcall(function()
+            packetEvent:FireServer(buffer.fromstring(payload))
+        end)
+    end
+end
+
+-- Robust Own Plot Finder
+local function getOwnPlot()
+    if state.cachedPlot and state.cachedPlot.Parent then return state.cachedPlot end
+    
+    for _, plot in ipairs(gardens:GetChildren()) do
+        local ownerId = plot:GetAttribute("OwnerId")
+        if ownerId and tostring(ownerId) == tostring(localPlayer.UserId) then
+            state.cachedPlot = plot
+            return plot
+        end
+    end
+    
+    local uid = tostring(localPlayer.UserId)
+    for _, plot in ipairs(gardens:GetChildren()) do
+        local pf = plot:FindFirstChild("Plants")
+        if pf then
+            for _, plant in ipairs(pf:GetChildren()) do
+                if plant.Name:sub(1, #uid) == uid then
+                    state.cachedPlot = plot
+                    return plot
+                end
+            end
+        end
+    end
+
+    local hrp = localPlayer.Character and localPlayer.Character:FindFirstChild("HumanoidRootPart")
+    if hrp then
+        local best, bestDist = nil, math.huge
+        for _, plot in ipairs(gardens:GetChildren()) do
+            local spawn = plot:FindFirstChild("SpawnPoint")
+            if spawn then
+                local dist = (spawn.Position - hrp.Position).Magnitude
+                if dist < bestDist then
+                    bestDist = dist
+                    best = plot
+                end
+            end
+        end
+        if best then
+            state.cachedPlot = best
+            return best
+        end
+    end
+end
+
+-- UNIVERSAL TELEPORT WRAPPER
+local function checkAndTPToGarden()
+    local myPlot = getOwnPlot()
+    local plotSpawn = myPlot and myPlot:FindFirstChild("SpawnPoint")
+    local hrp = localPlayer.Character and localPlayer.Character:FindFirstChild("HumanoidRootPart")
+    
+    if plotSpawn and hrp then
+        if (hrp.Position - plotSpawn.Position).Magnitude > 150 then
+            firePacket(string.char(20, 0, 6) .. "Garden")
+            task.wait(0.5) 
+        end
+    end
+end
+
+-- Filter Logic
+local function isValidFruit(fruit)
+    local sizeMulti = fruit:GetAttribute("SizeMulti")
+    if sizeMulti then
+        local kg = math.round(sizeMulti * 1000)
+        if kg < state.minKg or kg > state.maxKg then
+            return false
+        end
+    end
+    
+    local mut = fruit:GetAttribute("Mutation") or fruit:GetAttribute("MutationName") or fruit:GetAttribute("Mutated") or ""
+    if typeof(mut) == "boolean" then mut = mut and "Mutated" or "" end
+    local mutStr = string.lower(tostring(mut))
+    
+    if state.mutationMode == "Only Mutated" and mutStr == "" then return false end
+    if state.mutationMode == "Ignore Mutated" and mutStr ~= "" then return false end
+    
+    if state.targetMutation ~= "" then
+        if not string.find(mutStr, string.lower(state.targetMutation)) then return false end
+    end
+    
+    return true
+end
+
+local function getFruitPosition(fruit)
+    if fruit:IsA("BasePart") then return fruit.Position end
+    local part = fruit.PrimaryPart or fruit:FindFirstChildWhichIsA("BasePart", true)
+    return part and part.Position or Vector3.zero
+end
+
+local function getMoney()
+    local stats = localPlayer:FindFirstChild("leaderstats")
+    if stats then
+        local sheckles = stats:FindFirstChild("Sheckles") or stats:FindFirstChild("Money")
+        if sheckles then return sheckles.Value end
+    end
+    return 0
+end
+
+local function isInventoryFull()
+    local count = #localPlayer.Backpack:GetChildren()
+    if localPlayer.Character then
+        count = count + #localPlayer.Character:GetChildren()
+    end
+    return count >= state.maxInventoryItems
+end
+
+local function hasFruits()
+    local function checkContainer(container)
+        if not container then return false end
+        for _, item in ipairs(container:GetChildren()) do
+            if item:IsA("Tool") then
+                local name = item.Name
+                if name ~= "Shovel" and name ~= "Build" and not string.find(name, "Watering Can") and not string.find(name, "Sprinkler") and not string.find(name, "Seed") then
+                    if item:GetAttribute("SizeMulti") or item:GetAttribute("Weight") or item:GetAttribute("CorePartName") or string.find(name, "Fruit") then
+                        return true
+                    end
+                end
+            end
+        end
+        return false
+    end
+    if checkContainer(localPlayer.Backpack) then return true end
+    if localPlayer.Character and checkContainer(localPlayer.Character) then return true end
+    return false
+end
+
+local function flingCharacter(targetChar)
+    local hrp = targetChar:FindFirstChild("HumanoidRootPart")
+    if not hrp then return end
+    task.spawn(function()
+        for i = 1, 10 do
+            if hrp.Parent then
+                hrp.Velocity = Vector3.new(0, 1e5, 0)
+                hrp.AssemblyAngularVelocity = Vector3.new(1e5, 1e5, 1e5)
+            end
+            task.wait(0.05)
+        end
+    end)
+end
+
+local function tweenCharacter(targetCFrame, customSpeed)
+    local hrp = localPlayer.Character and localPlayer.Character:FindFirstChild("HumanoidRootPart")
+    if not hrp then return end
+    
+    local distance = (hrp.Position - targetCFrame.Position).Magnitude
+    local speed = tonumber(customSpeed) or tonumber(state.tweenSpeed) or 150
+    if speed < 10 then speed = 10 end
+    local time = math.clamp(distance / speed, 0.15, 3.0)
+    local tween = tweenService:Create(hrp, TweenInfo.new(time, Enum.EasingStyle.Linear), { CFrame = targetCFrame })
+    tween:Play()
+    tween.Completed:Wait()
+end
+
+local function walkTo(targetPos, ownerChar)
+    local char = localPlayer.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if not hum or not hrp then return false end
+    
+    hum.WalkSpeed = state.stealWalkSpeed
+    hum:MoveTo(targetPos)
+    
+    local startTime = tick()
+    local aborted = false
+    
+    while (hrp.Position - targetPos).Magnitude > 4 do
+        if tick() - startTime > 4 then break end
+        if not state.autoSteal then aborted = true break end
+        
+        if ownerChar then
+            local oHrp = ownerChar:FindFirstChild("HumanoidRootPart")
+            if oHrp and (oHrp.Position - hrp.Position).Magnitude <= state.dodgeRange then
+                aborted = true
+                break
+            end
+        end
+        
+        task.wait(0.1)
+    end
+    
+    hum.WalkSpeed = 16
+    return not aborted
+end
+
+local function columnToPositions(column)
+    local positions = {}
+    local cx, cy, cz = column.Position.X, column.Position.Y, column.Position.Z
+    local sx, sz = column.Size.X, column.Size.Z
+    local y = cy + 0.25
+    local x = cx - sx / 2 + SPACING / 2
+    while x <= cx + sx / 2 - SPACING / 2 + 0.01 do
+        local z = cz - sz / 2 + SPACING / 2
+        while z <= cz + sz / 2 - SPACING / 2 + 0.01 do
+            table.insert(positions, Vector3.new(x, y, z))
+            z = z + SPACING
+        end
+        x = x + SPACING
+    end
+    return positions
+end
+
+local function isOccupied(pos, plantsFolder, pending)
+    for _, plant in ipairs(plantsFolder:GetChildren()) do
+        local base = plant:FindFirstChildWhichIsA("BasePart", true)
+        if base then
+            local dx = base.Position.X - pos.X
+            local dz = base.Position.Z - pos.Z
+            if (dx * dx + dz * dz) < 9 then return true end
+        end
+    end
+    for _, p in ipairs(pending) do
+        local dx = p.X - pos.X
+        local dz = p.Z - pos.Z
+        if (dx * dx + dz * dz) < 9 then return true end
+    end
+    return false
+end
+
+local function nextSeed()
+    for _, tool in ipairs(localPlayer.Backpack:GetChildren()) do
+        if SEED_SET[tool.Name] then return tool end
+    end
+    local character = localPlayer.Character
+    if character then
+        for _, tool in ipairs(character:GetChildren()) do
+            if tool:IsA("Tool") and SEED_SET[tool.Name] then return tool end
+        end
+    end
+end
+
+-- PROTECT LOGIC (Orbit & Hit)
+local function performProtect()
+    local myPlot = getOwnPlot()
+    if not myPlot then return false end
+    local plotSpawn = myPlot:FindFirstChild("SpawnPoint")
+    local myHrp = localPlayer.Character and localPlayer.Character:FindFirstChild("HumanoidRootPart")
+    if not plotSpawn or not myHrp then return false end
+    
+    if (myHrp.Position - plotSpawn.Position).Magnitude > 60 then
+        return false
+    end
+
+    local closestThief = nil
+    local closestDist = math.huge
+
+    for _, player in ipairs(playersService:GetPlayers()) do
+        if player ~= localPlayer and player.Character then
+            local eHrp = player.Character:FindFirstChild("HumanoidRootPart")
+            local eHum = player.Character:FindFirstChildOfClass("Humanoid")
+            if eHrp and eHum and eHum.Health > 0 then
+                local dist = (eHrp.Position - plotSpawn.Position).Magnitude
+                if dist <= 60 and dist < closestDist then
+                    closestDist = dist
+                    closestThief = player.Character
+                end
+            end
+        end
+    end
+
+    if closestThief then
+        local myChar = localPlayer.Character
+        local myHum = myChar and myChar:FindFirstChildOfClass("Humanoid")
+        if not myHum then return false end
+        
+        local shovel = myChar:FindFirstChild("Shovel") or localPlayer.Backpack:FindFirstChild("Shovel")
+        if shovel and shovel.Parent == localPlayer.Backpack then
+            myHum:EquipTool(shovel)
+            task.wait(0.1)
+            shovel = myChar:FindFirstChild("Shovel")
+        end
+
+        if shovel then
+            local enemyHrp = closestThief:FindFirstChild("HumanoidRootPart")
+            if not enemyHrp then return false end
+            
+            local orbitPos = enemyHrp.Position + (enemyHrp.CFrame.LookVector * 3) + (enemyHrp.CFrame.RightVector * 2)
+            tweenCharacter(CFrame.new(orbitPos), state.protectTweenSpeed)
+            
+            if (myHrp.Position - enemyHrp.Position).Magnitude <= 7 then
+                pcall(function() shovel:Activate() end)
+            end
+            
+            return true
+        end
+    end
+    return false
+end
+
+-- INSTANT HARVEST LOGIC
+local function performHarvest(target)
+    local prompt = target:FindFirstChildWhichIsA("ProximityPrompt", true)
+    if prompt and prompt.Parent then
+        local pos = getFruitPosition(target)
+        if pos ~= Vector3.zero then
+            local hrp = localPlayer.Character and localPlayer.Character:FindFirstChild("HumanoidRootPart")
+            
+            if state.instantHarvest and hrp then
+                -- Instant Snap
+                hrp.CFrame = CFrame.new(pos + Vector3.new(0, 3, 0))
+                task.wait(0.05) -- Brief wait for server to accept distance
+                pcall(function() fireproximityprompt(prompt) end)
+                task.wait(0.05)
+            else
+                -- Normal Tween
+                tweenCharacter(CFrame.new(pos + Vector3.new(0, 3, 0)))
+                task.wait(tonumber(state.harvestDelay) or 0.1)
+                pcall(function() fireproximityprompt(prompt) end)
+                task.wait(tonumber(state.harvestDelay) or 0.1)
+            end
+            return true
+        end
+    end
+    return false
+end
+
+local function performSellSequence()
+    firePacket(string.char(20, 0, 4) .. "Sell")
+    task.wait(tonumber(state.sellDelay) or 0.5) 
+    state.lastSeq = (state.lastSeq + 1) % 128
+    firePacket(string.char(17, 1, state.lastSeq))
+    task.wait(tonumber(state.sellDelay) or 0.5)
+    state.lastSeq = (state.lastSeq + 1) % 128
+    firePacket(string.char(16, 1, state.lastSeq))
+    task.wait(tonumber(state.sellDelay) or 0.5)
+    state.lastSeq = (state.lastSeq + 1) % 128
+    firePacket(string.char(15, 1, state.lastSeq))
+    task.wait(1)
+    checkAndTPToGarden()
+end
+
+local function performSteal()
+    local isNight = lighting.ClockTime < 6 or lighting.ClockTime > 18
+    if not isNight then return false end
+    
+    local myPlot = getOwnPlot()
+    if not myPlot then return false end
+    local plots = {}
+    
+    for _, plot in ipairs(gardens:GetChildren()) do
+        if plot ~= myPlot and tostring(plot:GetAttribute("OwnerId")) ~= tostring(localPlayer.UserId) then
+            local val = 0
+            local hasValidFruit = false
+            local pf = plot:FindFirstChild("Plants")
+            if pf then
+                for _, plant in ipairs(pf:GetChildren()) do
+                    local ff = plant:FindFirstChild("Fruits")
+                    if ff and #ff:GetChildren() > 0 then
+                        for _, fruit in ipairs(ff:GetChildren()) do
+                            if isValidFruit(fruit) then
+                                val = val + (fruit:GetAttribute("SizeMulti") or 1)
+                                hasValidFruit = true
+                            end
+                        end
+                    else
+                        if isValidFruit(plant) then
+                            val = val + 1
+                            hasValidFruit = true
+                        end
+                    end
+                end
+            end
+            
+            if hasValidFruit then
+                local ownerId = plot:GetAttribute("OwnerId")
+                local ownerPlayer = ownerId and playersService:GetPlayerByUserId(ownerId) or nil
+                local isOwnerPresent = false
+                
+                if ownerPlayer and ownerPlayer.Character then
+                    local spawn = plot:FindFirstChild("SpawnPoint")
+                    if spawn then
+                        local oHrp = ownerPlayer.Character:FindFirstChild("HumanoidRootPart")
+                        if oHrp and (oHrp.Position - spawn.Position).Magnitude <= 60 then
+                            isOwnerPresent = true
+                        end
+                    end
+                end
+
+                table.insert(plots, { plot = plot, val = val, owner = ownerPlayer, ownerPresent = isOwnerPresent }) 
+            end
+        end
+    end
+    
+    if state.stealTargetPlayer ~= "All Players" then
+        for i = #plots, 1, -1 do
+            local p = plots[i]
+            if not p.owner or p.owner.Name ~= state.stealTargetPlayer then
+                table.remove(plots, i)
+            end
+        end
+    end
+    
+    local ignorePresence = string.find(state.stealSortMethod, "No Owner") ~= nil
+    if ignorePresence then
+        for i = #plots, 1, -1 do
+            if plots[i].ownerPresent then table.remove(plots, i) end
+        end
+    end
+    
+    table.sort(plots, function(a, b) 
+        if string.find(state.stealSortMethod, "Least") then return a.val < b.val
+        else return a.val > b.val end
+    end)
+    
+    for _, data in ipairs(plots) do
+        local bestPlot = data.plot
+        checkAndTPToGarden() 
+        
+        if data.ownerPresent and data.owner and state.flingOwner then
+            local spawn = bestPlot:FindFirstChild("SpawnPoint")
+            local timeout = 5
+            local startTime = tick()
+            
+            while tick() - startTime < timeout do
+                if not state.autoSteal then break end
+                if not data.owner.Character then break end
+                local currentHrp = data.owner.Character:FindFirstChild("HumanoidRootPart")
+                if not currentHrp or not spawn or (currentHrp.Position - spawn.Position).Magnitude > 60 then break end
+                flingCharacter(data.owner.Character)
+                task.wait(0.5)
+            end
+        end
+        
+        local pf = bestPlot:FindFirstChild("Plants")
+        if pf then
+            local validTargets = {}
+            for _, plant in ipairs(pf:GetChildren()) do
+                local ff = plant:FindFirstChild("Fruits")
+                if ff and #ff:GetChildren() > 0 then
+                    for _, fruit in ipairs(ff:GetChildren()) do
+                        if isValidFruit(fruit) then
+                            table.insert(validTargets, { 
+                                target = fruit, 
+                                value = fruit:GetAttribute("SizeMulti") or 0 
+                            })
+                        end
+                    end
+                else
+                    if isValidFruit(plant) then
+                        table.insert(validTargets, { 
+                            target = plant, 
+                            value = plant:GetAttribute("SizeMulti") or 0 
+                        })
+                    end
+                end
+            end
+            
+            table.sort(validTargets, function(a, b) return a.value > b.value end)
+            
+            for _, item in ipairs(validTargets) do
+                if not state.autoSteal then break end
+                local targetFruit = item.target
+                local targetPos = getFruitPosition(targetFruit)
+                local ownerChar = data.owner and data.owner.Character or nil
+                
+                if state.instantHarvest then
+                    local myHrp = localPlayer.Character and localPlayer.Character:FindFirstChild("HumanoidRootPart")
+                    if myHrp then
+                        myHrp.CFrame = CFrame.new(targetPos + Vector3.new(0, 3, 0))
+                        task.wait(0.05)
+                        local prompt = targetFruit:FindFirstChildWhichIsA("ProximityPrompt", true)
+                        if prompt then pcall(function() fireproximityprompt(prompt) end) end
+                        task.wait(0.05)
+                    end
+                else
+                    local success = walkTo(targetPos, ownerChar)
+                    
+                    if success then
+                        local prompt = targetFruit:FindFirstChildWhichIsA("ProximityPrompt", true)
+                        if prompt then
+                            task.wait(tonumber(state.harvestDelay) or 0.1)
+                            pcall(function() fireproximityprompt(prompt) end)
+                            task.wait(tonumber(state.harvestDelay) or 0.1)
+                        end
+                    else
+                        warn("[GaG2] Owner came too close! Dodging...")
+                        break
+                    end
+                end
+            end
+        end
+        
+        checkAndTPToGarden()
+        return true
+    end
+    return false
+end
+
+-- THE SCHEDULER
+task.spawn(function()
+    while not state.isUnloaded do
+        task.wait(0.05)
+        local didAction = false
+        local invFull = isInventoryFull()
+        
+        local anyToggled = state.autoHarvest or state.autoSteal or state.autoSell or state.autoBuy or state.autoPlant or state.autoProtect or state.autoExpand
+        if not anyToggled then
+            task.wait(0.5)
+            continue
+        end
+        
+        if state.autoProtect and not didAction then
+            local protected = performProtect()
+            if protected then
+                didAction = true
+                continue
+            end
+        end
+        
+        if invFull then
+            if state.autoSell then
+                warn("[GaG2] Inventory full & Auto Sell ON. Selling items...")
+                performSellSequence()
+                state.harvestedCount = 0
+                didAction = true
+                task.wait(1)
+            else
+                if not shared.invFullWarned then
+                    warn("[GaG2] Inventory full & Auto Sell OFF. Pausing actions.")
+                    shared.invFullWarned = true
+                end
+                task.wait(1)
+            end
+            continue 
+        else
+            shared.invFullWarned = false
+        end
+
+        if state.autoSteal and not didAction then
+            local success = performSteal()
+            if success then didAction = true end
+        end
+
+        if state.autoHarvest and not didAction then
+            local myPlot = getOwnPlot()
+            if myPlot then
+                local pf = myPlot:FindFirstChild("Plants")
+                if pf then
+                    local validTargets = {}
+                    for _, plant in ipairs(pf:GetChildren()) do
+                        local ff = plant:FindFirstChild("Fruits")
+                        if ff and #ff:GetChildren() > 0 then
+                            for _, fruit in ipairs(ff:GetChildren()) do
+                                if isValidFruit(fruit) then
+                                    table.insert(validTargets, { 
+                                        target = fruit, 
+                                        value = fruit:GetAttribute("SizeMulti") or 0 
+                                    })
+                                end
+                            end
+                        else
+                            if isValidFruit(plant) then
+                                table.insert(validTargets, { 
+                                    target = plant, 
+                                    value = plant:GetAttribute("SizeMulti") or 0 
+                                })
+                            end
+                        end
+                    end
+                    
+                    table.sort(validTargets, function(a, b) return a.value > b.value end)
+                    
+                    if #validTargets > 0 then
+                        local targetFruit = validTargets[1].target
+                        didAction = performHarvest(targetFruit)
+                        if didAction then 
+                            state.harvestedCount = state.harvestedCount + 1
+                        end
+                    end
+                end
+            end
+        end
+
+        if state.autoSellAfterHarvest and not didAction then
+            if state.harvestedCount >= state.sellThreshold then
+                if hasFruits() then
+                    performSellSequence()
+                    state.harvestedCount = 0
+                    didAction = true
+                else
+                    state.harvestedCount = 0 
+                end
+            end
+        end
+
+        if state.autoPlant and not didAction then
+            local plot = getOwnPlot()
+            if plot then
+                local visual = plot:FindFirstChild("Visual")
+                local pf = plot:FindFirstChild("Plants")
+                if visual and pf then
+                    local columns = { visual:FindFirstChild("PlantAreaColumn1"), visual:FindFirstChild("PlantAreaColumn2") }
+                    local plantedThisTick = false
+                    
+                    for _, col in ipairs(columns) do
+                        if col then
+                            local positions = columnToPositions(col)
+                            for _, pos in ipairs(positions) do
+                                if not isOccupied(pos, pf, {}) then
+                                    local tool = nextSeed()
+                                    if tool then
+                                        local hrp = localPlayer.Character and localPlayer.Character:FindFirstChild("HumanoidRootPart")
+                                        local hum = localPlayer.Character and localPlayer.Character:FindFirstChildOfClass("Humanoid")
+                                        if hrp and hum then
+                                            checkAndTPToGarden()
+                                            tweenCharacter(CFrame.new(pos.X, pos.Y + 3, pos.Z))
+                                            task.wait(tonumber(state.plantDelay) or 0.3)
+                                            
+                                            if tool.Parent == localPlayer.Backpack then 
+                                                hum:EquipTool(tool) 
+                                            end
+                                            
+                                            task.wait(0.2)
+                                            local eq = localPlayer.Character:FindFirstChild(tool.Name)
+                                            
+                                            if eq and eq:IsA("Tool") then
+                                                local payload = "\x24\x00" .. packFloats(pos) .. string.char(#eq.Name) .. eq.Name
+                                                pcall(function() 
+                                                    packetEvent:FireServer(buffer.fromstring(payload), { eq }) 
+                                                end)
+                                                task.wait(tonumber(state.plantDelay) or 0.3)
+                                                hum:UnequipTools()
+                                                didAction = true
+                                                plantedThisTick = true
+                                                state.isPlanting = true
+                                                break
+                                            end
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                        if plantedThisTick then break end
+                    end
+                    
+                    if not plantedThisTick and state.isPlanting then
+                        state.isPlanting = false
+                        local spawn = plot:FindFirstChild("SpawnPoint")
+                        if spawn then
+                            tweenCharacter(spawn.CFrame + Vector3.new(0, 3, 0))
+                            didAction = true
+                        end
+                    end
+                end
+            end
+        end
+
+        if state.autoSell and not didAction then
+            if hasFruits() then
+                performSellSequence()
+                didAction = true
+                state.harvestedCount = 0
+            end
+        end
+
+        if state.autoBuy and not didAction then
+            for name, selected in pairs(state.buyTargets) do
+                if selected then
+                    local price = SEED_PRICES[name] or 0
+                    if getMoney() >= price then
+                        firePacket(string.char(184, 0, #name) .. name)
+                        task.wait(tonumber(state.buyDelay) or 0.15)
+                        didAction = true
+                        break 
+                    end
+                end
+            end
+        end
+
+        if state.autoExpand and not didAction then
+            firePacket(string.char(66, 1, 45))
+            task.wait(1)
+            didAction = true
+        end
+        
+        if not didAction then task.wait(0.5) end
+    end
+end)
+
+-- Load Linoria.
+local repo = "https://raw.githubusercontent.com/violin-suzutsuki/LinoriaLib/main/"
+local Library = loadstring(game:HttpGet(repo .. "Library.lua"))()
+local ThemeManager = loadstring(game:HttpGet(repo .. "addons/ThemeManager.lua"))()
+local SaveManager = loadstring(game:HttpGet(repo .. "addons/SaveManager.lua"))()
+
+Library.ToggleKeybind = Enum.KeyCode.RightControl
+
+local Window = Library:CreateWindow({
+    Title = "Grow a Garden 2",
+    Center = true,
+    AutoShow = true,
+    TabPadding = 8,
+})
+
+local Tabs = { 
+    Main = Window:AddTab("Main"),
+    Misc = Window:AddTab("Misc"),
+    Settings = Window:AddTab("Settings")
+}
+
+-- MAIN TAB
+local AutoGroup = Tabs.Main:AddLeftGroupbox("Automation")
+local SubGroup = Tabs.Main:AddRightGroupbox("Sub-Features")
+
+AutoGroup:AddToggle("InstantHarvest", { Text = "Instant Harvest (Fast)", Default = false, Callback = function(v) state.instantHarvest = v end })
+AutoGroup:AddToggle("AutoHarvest", { Text = "Auto Harvest", Default = false, Callback = function(v) state.autoHarvest = v end })
+AutoGroup:AddToggle("AutoSteal", { Text = "Auto Steal (Night Only)", Default = false, Callback = function(v) state.autoSteal = v end })
+AutoGroup:AddToggle("AutoSell", { Text = "Auto Sell (Continuous)", Default = false, Callback = function(v) state.autoSell = v end })
+AutoGroup:AddToggle("AutoBuy", { Text = "Auto Buy Seeds", Default = false, Callback = function(v) state.autoBuy = v end })
+AutoGroup:AddToggle("AutoPlant", { Text = "Auto Plant", Default = false, Callback = function(v) state.autoPlant = v end })
+AutoGroup:AddToggle("AutoExpand", { Text = "Auto Expand Plot", Default = false, Callback = function(v) state.autoExpand = v end })
+AutoGroup:AddToggle("AutoProtect", { Text = "Auto Protect (Tween Orbit)", Default = false, Callback = function(v) state.autoProtect = v end })
+
+SubGroup:AddSlider("TweenSpeed", { 
+    Text = "Harvest Tween Speed (Studs/s)", 
+    Default = 150, 
+    Min = 10, 
+    Max = 500, 
+    Rounding = 0, 
+    Compact = false, 
+    Callback = function(v) state.tweenSpeed = tonumber(v) or 150 end 
+})
+SubGroup:AddSlider("ProtectTweenSpeed", { 
+    Text = "Protect Tween Speed (Studs/s)", 
+    Default = 25, 
+    Min = 10, 
+    Max = 100, 
+    Rounding = 0, 
+    Compact = false, 
+    Callback = function(v) state.protectTweenSpeed = tonumber(v) or 25 end 
+})
+SubGroup:AddSlider("HarvestDelay", { Text = "Harvest/Steal Delay (s)", Default = 0.1, Min = 0.05, Max = 2, Rounding = 1, Compact = false, Callback = function(v) state.harvestDelay = tonumber(v) or 0.1 end })
+SubGroup:AddSlider("PlantDelay", { Text = "Plant Delay (s)", Default = 0.3, Min = 0.1, Max = 2, Rounding = 1, Compact = false, Callback = function(v) state.plantDelay = tonumber(v) or 0.3 end })
+SubGroup:AddSlider("BuyDelay", { Text = "Buy Delay (s)", Default = 0.15, Min = 0.05, Max = 1, Rounding = 1, Compact = false, Callback = function(v) state.buyDelay = tonumber(v) or 0.15 end })
+SubGroup:AddSlider("SellDelay", { Text = "Sell Delay (s)", Default = 0.5, Min = 0.1, Max = 2, Rounding = 1, Compact = false, Callback = function(v) state.sellDelay = tonumber(v) or 0.5 end })
+
+-- MISC TAB
+local MiscGroup = Tabs.Misc:AddLeftGroupbox("Server & Player Targets")
+local BuyGroup = Tabs.Misc:AddLeftGroupbox("Buy Settings")
+local InvGroup = Tabs.Misc:AddRightGroupbox("Inventory Management")
+local FilterGroup = Tabs.Misc:AddRightGroupbox("Fruit Filters")
+local StealGroup = Tabs.Misc:AddLeftGroupbox("Steal Settings")
+
+StealGroup:AddSlider("StealWalkSpeed", { 
+    Text = "Walk Speed (Studs/s)", 
+    Default = 35, 
+    Min = 16, 
+    Max = 100, 
+    Rounding = 0, 
+    Compact = false, 
+    Callback = function(v) state.stealWalkSpeed = tonumber(v) or 35 end 
+})
+StealGroup:AddSlider("DodgeRange", { 
+    Text = "Dodge Range (Studs)", 
+    Default = 25, 
+    Min = 5, 
+    Max = 60, 
+    Rounding = 0, 
+    Compact = false, 
+    Callback = function(v) state.dodgeRange = tonumber(v) or 25 end 
+})
+StealGroup:AddDropdown("StealSort", {
+    Text = "Steal Plot Sort",
+    Values = {"Most Expensive", "Least Expensive", "Most Expensive (No Owner)", "Least Expensive (No Owner)"},
+    Default = "Most Expensive",
+    Multi = false,
+    Callback = function(v) state.stealSortMethod = v end
+})
+local PlayerDrop = StealGroup:AddDropdown("StealPlayer", {
+    Text = "Steal Target Player",
+    Values = getPlayerList(),
+    Default = "All Players",
+    Multi = false,
+    Callback = function(v) state.stealTargetPlayer = v end
+})
+StealGroup:AddButton({
+    Text = "Refresh Player List",
+    Func = function()
+        local list = getPlayerList()
+        local old = state.stealTargetPlayer
+        PlayerDrop:SetValues(list)
+        state.stealTargetPlayer = old
+    end
+})
+StealGroup:AddToggle("FlingOwner", { Text = "Fling Plot Owner", Default = false, Callback = function(v) state.flingOwner = v end })
+
+local BuyDropdown = BuyGroup:AddDropdown("BuyTargets", { 
+    Text = "Seeds to Buy", 
+    Values = SEED_LIST, 
+    Default = SEED_SET,
+    Multi = true, 
+    Callback = function(v) state.buyTargets = v end 
+})
+BuyGroup:AddButton({ Text = "Select All", Func = function() BuyDropdown:SetValue(SEED_SET) end })
+BuyGroup:AddButton({ Text = "Clear All", Func = function() BuyDropdown:SetValue({}) end })
+
+MiscGroup:AddToggle("AutoExec", { Text = "Auto Execute on Rejoin", Default = false })
+MiscGroup:AddButton({
+    Text = "Rejoin Server",
+    Func = function()
+        local src = debug.info(1, "s")
+        local autoExecCode = ""
+        if src:sub(1, 1) == "=" then
+            autoExecCode = "loadstring(game:HttpGet('" .. src:sub(2) .. "'))()"
+        elseif src:sub(1, 1) == "@" then
+            autoExecCode = "loadstring(readfile('" .. src:sub(2) .. "'))()"
+        end
+        if Toggles.AutoExec.Value and autoExecCode ~= "" then
+            queue_on_teleport(autoExecCode)
+        end
+        teleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, localPlayer)
+    end,
+})
+MiscGroup:AddButton({
+    Text = "Unload Script",
+    Func = function()
+        state.isUnloaded = true
+        for _, toggle in pairs(Toggles) do
+            if toggle.Value then pcall(function() toggle:SetValue(false) end) end
+        end
+        Library:Unload()
+    end,
+})
+
+InvGroup:AddToggle("AutoSellAfterHarvest", { Text = "Sell After X Harvested", Default = false, Callback = function(v) state.autoSellAfterHarvest = v end })
+InvGroup:AddSlider("SellThreshold", { 
+    Text = "Sell Threshold (Items)", 
+    Default = 15, 
+    Min = 1, 
+    Max = 100, 
+    Rounding = 0, 
+    Compact = false, 
+    Callback = function(v) state.sellThreshold = tonumber(v) or 15 end 
+})
+InvGroup:AddSlider("MaxInventory", { 
+    Text = "Max Inventory Items", 
+    Default = 80, 
+    Min = 20, 
+    Max = 500, 
+    Rounding = 0, 
+    Compact = false, 
+    Callback = function(v) state.maxInventoryItems = tonumber(v) or 80 end 
+})
+
+FilterGroup:AddSlider("MinKg", { 
+    Text = "Min Weight (kg)", 
+    Default = 0, 
+    Min = 0, 
+    Max = 5000, 
+    Rounding = 0, 
+    Compact = false, 
+    Callback = function(v) state.minKg = tonumber(v) or 0 end 
+})
+FilterGroup:AddSlider("MaxKg", { 
+    Text = "Max Weight (kg)", 
+    Default = 100000, 
+    Min = 1000, 
+    Max = 100000, 
+    Rounding = 0, 
+    Compact = false, 
+    Callback = function(v) state.maxKg = tonumber(v) or 100000 end 
+})
+FilterGroup:AddDropdown("MutationMode", { 
+    Text = "Mutation Filter", 
+    Values = {"All", "Only Mutated", "Ignore Mutated"}, 
+    Default = "All", 
+    Multi = false,
+    Callback = function(v) state.mutationMode = v end 
+})
+FilterGroup:AddInput("TargetMutation", { 
+    Text = "Target Mutation Name (e.g. Gold)", 
+    Default = "", 
+    Placeholder = "Leave empty for any", 
+    TextDisappear = false,
+    Callback = function(v) state.targetMutation = v end 
+})
+
+-- SETTINGS TAB
+local SettingsGroup = Tabs.Settings:AddLeftGroupbox("Settings")
+SettingsGroup:AddLabel("All settings have been moved to the Misc tab!")
+
+SaveManager:SetLibrary(Library)
+ThemeManager:SetLibrary(Library)
+SaveManager:IgnoreThemeSettings()
+SaveManager:SetIgnoreIndexes({})
+ThemeManager:SetFolder("GaG2")
+SaveManager:BuildConfigSection(Tabs.Settings)
+ThemeManager:ApplyToTab(Tabs.Settings)
+
+task.defer(getOwnPlot)
+print("[GaG2] Instant Harvest added. Steal logic corrected.")
